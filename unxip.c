@@ -1,57 +1,124 @@
+// Faster unxip, hopefully
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
 #include <zlib.h>
+#include <bzlib.h>
 
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 
-#define BAD() do { printf("Error @ %s:%d (%d)\n", __FILE__, __LINE__, ret); exit(0); } while (0);
+#include "unxip.h"
 
-void process_toc(uint8_t *toc_buffer, uint32_t toc_len) {
-    xmlDocPtr doc = xmlReadMemory(toc_buffer, toc_len, "root.xml", NULL, 0);
-    printf("doc = %p\n", doc);
+void print_file_info(file_info *info) {
+    printf("file_location = (length = 0x%llx, offset = 0x%llx, size = 0x%llx)\n", 
+            info->location.length, info->location.offset, info->location.size); 
+}
 
-    xmlNode *rootNode = xmlDocGetRootElement(doc);
-    // ASSERT(rootNode->name == 'xar')
-    // ASSERT(rootName->children->name == 'toc')
+void printNode(xmlNode *node) {
+#define PRINT_MEMBER(thing, specifier) do { \
+    printf(#thing " = " specifier ", ", thing); \
+} while (0);
+
+    printf("{ ");
+    PRINT_MEMBER(node->type, "%d");
+    PRINT_MEMBER(node->name, "\"%s\"");
+    // PRINT_MEMBER(node->parent, "%p");
+    // PRINT_MEMBER(node->children, "%p");
+    // PRINT_MEMBER(node->last, "%p");
+    // PRINT_MEMBER(node->next, "%p");
+    // PRINT_MEMBER(node->prev, "%p");
+    // PRINT_MEMBER(node->doc, "%p");
+    PRINT_MEMBER(node->content, "%p");
+    if (node->properties) 
+        PRINT_MEMBER(node->properties, "%p");
+
+    printf("}\n");
+}
+
+static const char *const SpecialFileNameContent = "Content";
+static const char *const SpecialFileNameMetadata = "Metadata";
+
+int parse_file_data_xmlnode(xmlNode *file_node, file_location *location) {
+    xmlNode *iter = file_node->children;
+
+    while (iter) {
+        char *value = xmlNodeGetContent(iter);
+        if (NODE_NAME_EQUALS(iter, "length")) {
+            location->length = atoll(value);
+        }
+        else if (NODE_NAME_EQUALS(iter, "offset")) {
+            location->offset = atoll(value);
+        }
+        else if (NODE_NAME_EQUALS(iter, "size")) {
+            location->size = atoll(value);
+        }
+
+        iter = iter->next;
+    }
+
+    return 0;
+}
+
+int parse_file_xmlnode(xmlNode *file_node, xar_content *info) {
+    int ret = 0;
+
+    xmlNode *iter = file_node->children;
+
+    file_info *specific_info = NULL;
+
+    while (iter) {
+        if (NODE_NAME_EQUALS(iter, "name")) {
+            char *value = xmlNodeGetContent(iter);
+            if (strcmp(value, SpecialFileNameContent) == 0) 
+                specific_info = &(info->content);
+            else if (strcmp(value, SpecialFileNameMetadata) == 0)
+                specific_info = &(info->metadata);
+            else 
+                BAD();
+        }
+
+        iter = iter->next;
+    }
+
+    // Found the node, let's add the values to the struct
+    iter = file_node->children;
+    while (iter) {
+        if (NODE_NAME_EQUALS(iter, "data")) {
+            ret = parse_file_data_xmlnode(iter, &specific_info->location);
+        }
+
+        // XXX: Ignore FinderCreateTime and the rest for now, they aren't
+        // important to extraction
+        iter = iter->next;
+    }
+
+    return 0;
+}
+
+int process_toc(uint8_t *toc_buffer, uint32_t toc_len, xar_content *content) {
+    int ret = 0;
+
+    /*  Document format:
+     *  xar { toc { creation-time, checksum, signature, file, file } }
+     */
+    xmlDocPtr document = xmlReadMemory(toc_buffer, toc_len, "root.xml", NULL, 0);
+    xmlNode *rootNode = xmlDocGetRootElement(document);
+    // TODO: ASSERT(rootNode->name == 'xar')
+    // TODO: ASSERT(rootName->children->name == 'toc')
 
     for (xmlNode *iter = rootNode->children->children; iter; iter = iter->next) {
-        printf("Node name: %s\n", iter->name);
-        if (strcmp(iter->name, "file") == 0) {
+        if (NODE_NAME_EQUALS(iter, "file")) {
             // Found file node
-            /* <file id="1">
-                <data>
-                    <length>10747150068</length>
-                    <encoding style="application/octet-stream"></encoding>
-                    <offset>276</offset>
-                    <size>10747150068</size>
-                    <extracted-checksum style="sha1">dbd95e2cfe26a1d5dbeb1582acfea371bce5ac91</extracted-checksum>
-                    <archived-checksum style="sha1">dbd95e2cfe26a1d5dbeb1582acfea371bce5ac91</archived-checksum>
-                </data>
-                <FinderCreateTime>
-                    <nanoseconds>140733193388032</nanoseconds>
-                    <time>1970-01-01T00:00:00</time>
-                    </FinderCreateTime>
-                    <ctime>2021-12-15T07:22:18Z</ctime>
-                    <mtime>2021-12-15T07:22:18Z</mtime>
-                    <atime>2021-12-15T06:13:45Z</atime>
-                    <group>wheel</group>
-                    <gid>0</gid>
-                    <user>root</user>
-                    <uid>0</uid>
-                    <mode>0644</mode>
-                    <deviceno>16777220</deviceno>
-                    <inode>1695348</inode>
-                    <type>file</type>
-                    <name>Content</name>
-                </file> */
+            ret = parse_file_xmlnode(iter, content);
+            if (ret) return ret;
         }
     }
 
-    xmlFreeDoc(doc);
+    xmlFreeDoc(document);
+    return ret;
 }
 
 int main(int argc, char **argv) {
@@ -79,11 +146,11 @@ int main(int argc, char **argv) {
     header.checksum_algo = htonl(header.checksum_algo);
 
     printf("XAR_HEADER = { \n");
-    printf("\t.magic = %p,\n", header.magic);
+    printf("\t.magic = 0x%x,\n", header.magic);
     printf("\t.header_size = %hd, \n", header.header_size);
     printf("\t.version = %hd, \n", header.version);
-    printf("\t.toc_compressed_size = %p, \n", header.toc_compressed_size);
-    printf("\t.toc_uncompressed_size = %p, \n", header.toc_uncompressed_size);
+    printf("\t.toc_compressed_size = 0x%llx, \n", header.toc_compressed_size);
+    printf("\t.toc_uncompressed_size = 0x%llx, \n", header.toc_uncompressed_size);
     printf("\t.checksum_algo = 0x%x\n", header.checksum_algo);
     printf("}\n");
 
@@ -94,12 +161,45 @@ int main(int argc, char **argv) {
     uint8_t *toc_uncompressed_buf = malloc(header.toc_uncompressed_size + 1);
     if (!toc_uncompressed_buf) BAD();
 
-    uint32_t uncompressed_bytes = header.toc_uncompressed_size;
+    uLongf uncompressed_bytes = (uLongf)header.toc_uncompressed_size;
     ret = uncompress(toc_uncompressed_buf, &uncompressed_bytes, toc_compressed_buf, header.toc_compressed_size);
-    printf("ret = %d, out: %d\n", ret, uncompressed_bytes);
-    printf("raw XML doc: %s\n", toc_uncompressed_buf);
+    // printf("ret = %d, out: %d\n", ret, uncompressed_bytes);
+    // printf("raw XML doc: %s\n", toc_uncompressed_buf);
 
-    process_toc(toc_uncompressed_buf, uncompressed_bytes);
+    xar_content content = { 0 };
+    ret = process_toc(toc_uncompressed_buf, uncompressed_bytes, &content);
+    if (ret) BAD();
+
+    printf("Content file info:\n");
+    print_file_info(&content.content);
+    printf("Metadat file info:\n");
+    print_file_info(&content.metadata);
+
+    fseek(fp, content.metadata.location.offset, SEEK_CUR);
+    uint8_t *metadata_buf = malloc(content.metadata.location.length);
+    uint8_t *metadata_decompressed = malloc(content.metadata.location.size + 1);
+    if (!metadata_buf || !metadata_decompressed) BAD();
+
+    ret = fread(metadata_buf, content.metadata.location.length, 1, fp);
+    if (ret != 1) BAD();
+
+    unsigned int destLen = content.metadata.location.size;
+    ret = BZ2_bzBuffToBuffDecompress(metadata_decompressed, &destLen, 
+            metadata_buf, content.metadata.location.length, 0, 4);
+    printf("%d\n", ret);
+    write(1, metadata_decompressed, content.metadata.location.size);
+    write(1, "\n", 1);
+
+   //  BZ_EXTERN int BZ_API(BZ2_bzBuffToBuffDecompress) (
+   //    char*         dest,
+   //    unsigned int* destLen,
+   //    char*         source,
+   //    unsigned int  sourceLen,
+   //    int           small,
+   //    int           verbosity
+   // );
+
+    
 
     fclose(fp);
 
