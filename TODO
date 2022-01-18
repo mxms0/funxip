@@ -1,0 +1,6 @@
+Step 1: Faster unxar 
+Step 2: Use a faster lzma / bzip / gzip
+Step 3: Faster CPIO
+    Step 3a. Buffer mkdir
+    Step 3b. Buffer setting permissions
+    Step 3c. Buffer disk writes (or use APFS magic if it exists)

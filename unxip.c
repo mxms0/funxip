@@ -190,16 +190,7 @@ int main(int argc, char **argv) {
     write(1, metadata_decompressed, content.metadata.location.size);
     write(1, "\n", 1);
 
-   //  BZ_EXTERN int BZ_API(BZ2_bzBuffToBuffDecompress) (
-   //    char*         dest,
-   //    unsigned int* destLen,
-   //    char*         source,
-   //    unsigned int  sourceLen,
-   //    int           small,
-   //    int           verbosity
-   // );
-
-    
+    fseek(fp, content.content.offset, SEEK_SET);
 
     fclose(fp);
 
