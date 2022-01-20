@@ -44,3 +44,9 @@ typedef struct {
     file_info content;
     file_info metadata;
 } xar_content;
+
+struct __attribute__((packed)) pbzxChunkHeader {
+    uint64_t flags;
+    uint64_t length;
+};
+
