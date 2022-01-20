@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #include <zlib.h>
 #include <lzma.h>
@@ -15,10 +16,12 @@
 #include "unxip.h"
 #include "msqueue/queue.h"
 
+#define min(x, y) ((x) < (y) ? (x) : (y))
+
 struct queue_root *work_queue = NULL;
 
 void print_file_info(file_info *info) {
-    printf("file_location = (length = 0x%llx, offset = 0x%llx, size = 0x%llx)\n", 
+    printf("file_location = (length = 0x%zx, offset = 0x%zx, size = 0x%zx)\n", 
             info->location.length, info->location.offset, info->location.size); 
 }
 
@@ -50,7 +53,7 @@ int parse_file_data_xmlnode(xmlNode *file_node, file_location *location) {
     xmlNode *iter = file_node->children;
 
     while (iter) {
-        char *value = xmlNodeGetContent(iter);
+        char *value = (char *)xmlNodeGetContent(iter);
         if (NODE_NAME_EQUALS(iter, "length")) {
             location->length = atoll(value);
         }
@@ -79,24 +82,26 @@ void worker_thread(void *_context) {
     uint8_t *lzData = malloc(0x1000000);
     uint8_t *lmData = malloc(0x1000000);
 
+    // Open file to work on
     int fd = open(context->file_path, O_RDONLY);
     if (!fd) BAD();
+
     uint64_t thread_id = context->thread_id;
+
     lzma_stream lzs = LZMA_STREAM_INIT;
-    lzma_stream_decoder(&lzs, UINT64_MAX, LZMA_CONCATENATED);
-    // Open file to work on
-    // Grab offset to start at from a worker thread
-    // Write file out to disk
+    if (lzma_stream_decoder(&lzs, UINT64_MAX, LZMA_CONCATENATED) != LZMA_OK) {
+        printf("Couldn't initialize stream decoder.\n");
+        exit(4);
+    }
+
     while ((1)) {
         // We are waiting for work.
         context->waiting_states[thread_id] = 1;
 
         struct queue_head *work_item = queue_get(work_queue);
-        if (!work_item) {
-            usleep(99);
-            continue;
-        }
+        if (!work_item) { usleep(99); continue; }
 
+        // Grab offset to start at from a worker thread
         uint64_t file_offset = (uint64_t)work_item->content;
         lseek(fd, file_offset, SEEK_SET);
         struct pbzxChunkHeader chunkHeader = { 0 };
@@ -109,22 +114,21 @@ void worker_thread(void *_context) {
         }
 
         lzs.next_in = (typeof(lzs.next_in)) lzData;
-#define min(x, y) ((x) < (y) ? (x) : (y))
         lzs.avail_in = chunkHeader.length;
+
         while (lzs.avail_in) {
             lzs.next_out = (typeof(lzs.next_out)) lmData;
             lzs.avail_out = 0x1000000;
+
             if (lzma_code(&lzs, LZMA_RUN) != LZMA_OK) {
-                fprintf(stderr, "LZMA failure");
+                printf("LZMA failure\n");
             }
-            // cpio_out(zbuf, ZBSZ - zs.avail_out);
+            // Handle decompressed data
         }
 
-        printf("[%d] Finished work\n", thread_id);
-        // Grab queue lock to remove work from it
-        // Found work, set waiting_state to busy
+        printf("[%llu] Finished work\n", thread_id);
+        // Write file out to disk
         context->waiting_states[thread_id] = 0;
-        // Begin work
     }
 }
 
@@ -137,7 +141,7 @@ int parse_file_xmlnode(xmlNode *file_node, xar_content *info) {
 
     while (iter) {
         if (NODE_NAME_EQUALS(iter, "name")) {
-            char *value = xmlNodeGetContent(iter);
+            char *value = (char *)xmlNodeGetContent(iter);
             if (strcmp(value, SpecialFileNameContent) == 0) 
                 specific_info = &(info->content);
             else if (strcmp(value, SpecialFileNameMetadata) == 0)
@@ -170,7 +174,7 @@ int process_toc(uint8_t *toc_buffer, uint32_t toc_len, xar_content *content) {
     /*  Document format:
      *  xar { toc { creation-time, checksum, signature, file, file } }
      */
-    xmlDocPtr document = xmlReadMemory(toc_buffer, toc_len, "root.xml", NULL, 0);
+    xmlDocPtr document = xmlReadMemory((const char *)toc_buffer, toc_len, "root.xml", NULL, 0);
     xmlNode *rootNode = xmlDocGetRootElement(document);
     // TODO: ASSERT(rootNode->name == 'xar')
     // TODO: ASSERT(rootName->children->name == 'toc')
@@ -242,8 +246,8 @@ int main(int argc, char **argv) {
     printf("Metadat file info:\n");
     print_file_info(&content.metadata);
 
-    printf("Seeking to: %llu\n", content.metadata.location.offset);
-    printf("Current offset: %llu\n", ftell(fp));
+    printf("Seeking to: %zu\n", content.metadata.location.offset);
+    printf("Current offset: %ld\n", ftell(fp));
 
     uint64_t base_offset = (uint64_t)ftell(fp);
 
@@ -257,8 +261,8 @@ int main(int argc, char **argv) {
 
     // This metadata file is basically worthless
     unsigned int destLen = content.metadata.location.size;
-    ret = BZ2_bzBuffToBuffDecompress(metadata_decompressed, &destLen, 
-            metadata_buf, content.metadata.location.length, 0, 4);
+    ret = BZ2_bzBuffToBuffDecompress((char *)metadata_decompressed, &destLen, 
+            (char *)metadata_buf, content.metadata.location.length, 0, 4);
     printf("BZ2 Status: %d\n", ret);
     write(1, metadata_decompressed, content.metadata.location.size);
     write(1, "\n", 1);
@@ -275,7 +279,7 @@ int main(int argc, char **argv) {
         uint64_t flags;
     } pbzxHeader = { 0 };
 
-    printf("what size is this: %d\n", sizeof(pbzxHeader));
+    printf("what size is this: %lu\n", sizeof(pbzxHeader));
 
     fread(&pbzxHeader, sizeof(pbzxHeader), 1, fp);
     bytes_consumed += sizeof(pbzxHeader);
@@ -293,7 +297,7 @@ int main(int argc, char **argv) {
         struct work_context *ctx = malloc(sizeof(struct work_context));
         ctx->file_path = file_path;
         ctx->thread_id = i;
-        ctx->waiting_states = &waiting_states;
+        ctx->waiting_states = waiting_states;
 
         pthread_t thread = { 0 };
         pthread_create(&thread, NULL, worker_thread, (void *)ctx);
@@ -328,12 +332,12 @@ int main(int argc, char **argv) {
         if (!is_pod && footer != 0x5a59) BAD();
         if (bytes_consumed >= content.content.location.size) break;
     }
-    printf("Queued up %d\n", num_queued);
+    
+    printf("Queued up %d chunks\n", num_queued);
 
     // Wait for workers to finish up 
-
     sleep(1000000000);
-    printf("\n");
+
     fclose(fp);
 
     return 0;
